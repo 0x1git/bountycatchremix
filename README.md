@@ -18,6 +18,8 @@ A bug bounty domain management tool for security researchers and penetration tes
 - **Bulk import** from text files with validation feedback
 - **Multiple export formats** (text and JSON with metadata)
 - **Project-based organisation** for multiple targets
+- **Domain removal** for cleaning up incorrectly added domains
+- **Project listing** to view all stored projects
 
 ### 🔧 **New Features**
 - **Configuration file support** with environment variable overrides
@@ -30,6 +32,7 @@ A bug bounty domain management tool for security researchers and penetration tes
 - **Text export** for integration with other tools
 - **Domain statistics** and duplicate reporting
 - **Project counting** and listing capabilities
+- **Project overview** showing all stored projects
 
 ## Installation
 
@@ -142,6 +145,22 @@ Print all domains in alphabetical order:
 python3 bountycatch.py print -p example-project
 ```
 
+#### **Listing All Projects**
+View all projects stored in Redis:
+```bash
+python3 bountycatch.py projects
+```
+
+#### **Removing Domains**
+Remove domains that were added by mistake:
+```bash
+# Remove a single domain
+python3 bountycatch.py remove -p example-project -d unwanted-domain.com
+
+# Remove multiple domains from a file
+python3 bountycatch.py remove -p example-project -f domains_to_remove.txt
+```
+
 #### **Exporting Domains**
 Export domains to various formats:
 ```bash
@@ -187,6 +206,13 @@ subdomain.example.org
 test.co.uk
 ```
 
+### Domain Removal List (domains_to_remove.txt)
+```
+unwanted-domain.com
+old-subdomain.example.com
+mistake.org
+```
+
 ### New: Validation Rules
 - Must be valid RFC-compliant domain names
 - No wildcards or protocols
@@ -228,39 +254,31 @@ subdomain.example.org
 - **Console** - Real-time feedback
 - **File** - `bountycatch.log` for persistent logging
 
-## Examples
+## Error Handling
 
-### Complete Workflow
-```bash
-# 1. Add domains with validation
-python3 bountycatch.py add -p bugcrowd-target -f subdomains.txt
+### Common Errors
 
-# 2. Check domain count
-python3 bountycatch.py count -p bugcrowd-target
+- **Connection errors**: Check if Redis is running and accessible.
+- **File not found**: Ensure the file paths are correct.
+- **Permission denied**: Check file and directory permissions.
 
-# 3. Export for further processing
-python3 bountycatch.py export -p bugcrowd-target -f results.json --format json
+### Domain Removal
+- **Domain not found**: Warns when trying to remove domains that don't exist in the project
+- **File not found**: Graceful handling when removal file doesn't exist
+- **Statistics reporting**: Shows count of successfully removed vs. not found domains
 
-# 4. Clean up when finished
-python3 bountycatch.py delete -p bugcrowd-target --confirm
-```
+### Project Management
+- **Non-existent projects**: Clear error messages when referencing projects that don't exist
+- **Redis connection issues**: Graceful failure with helpful error messages
+- **Invalid domain validation**: Automatic skipping with detailed logging
 
-### Integration with Other Tools
-```bash
-# Export domains for subdomain enumeration
-python3 bountycatch.py export -p target -f domains.txt
-subfinder -dL domains.txt -o new_subdomains.txt
+### Troubleshooting Tips
 
-# Import discovered subdomains
-python3 bountycatch.py add -p target -f new_subdomains.txt
-```
-## Licence
-
-This project maintains the same licence as the original work by Jason Haddix.
-
-## Acknowledgements
-
-- **Jason Haddix** - Original `bountycatch.py` concept.
+1. **Verbose logging**: Use the `-v` option for detailed logs.
+2. **Check Redis logs**: For connection-related issues.
+3. **Validate input files**: Ensure they meet the required format and permissions.
 
 ---
 Happy hunting folks! 🕵️‍♂️
+
+## Licence
