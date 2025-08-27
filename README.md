@@ -8,18 +8,21 @@ A bug bounty domain management tool for security researchers and penetration tes
 
 ## Overview
 
-**BountyCatch** is a simple Python application for managing domain lists in bug bounties. It provides domain validation, duplicate detection, multiple export formats, and Redis-backed storage with connection pooling!
+**BountyCatch** is a simple Python application for managing domain lists in bug bounties. It provides domain validation, duplicate detection, multiple export formats, and Redis-backed storage with connection pooling. All domains are stored in a single collection (no per-project flag needed).
 
 ## Features
 
 ### ✨ **Domain Management**
-- **Domain validation** with RFC-compliant regex patterns
+- **Domain validation** with a comprehensive regex that supports:
+  - Leading wildcards: `*.example.com`
+  - Internal wildcards: `svc-*.domain.com`, `rac-*.net.dell.com`, `test.*.invalid.com`
+  - Service records (underscore labels): `_service.domain.com`, `_collab-edge.5g.dell.com`
+  - Standard domains/subdomains: `example.com`, `sub.domain.com`
 - **Automatic duplicate detection** and statistics reporting
 - **Bulk import** from text files with validation feedback
 - **Multiple export formats** (text and JSON with metadata)
-- **Project-based organisation** for multiple targets
 - **Domain removal** for cleaning up incorrectly added domains
-- **Project listing** to view all stored projects
+- **List/print** and **count** domains
 
 ### 🔧 **New Features**
 - **Configuration file support** with environment variable overrides
@@ -28,11 +31,10 @@ A bug bounty domain management tool for security researchers and penetration tes
 - **Better error handling** with graceful failure recovery
 
 ### 📊 **Export & Analytics**
-- **JSON export** with project metadata and timestamps
+- **JSON export** with metadata and timestamps
 - **Text export** for integration with other tools
 - **Domain statistics** and duplicate reporting
-- **Project counting** and listing capabilities
-- **Project overview** showing all stored projects
+- **Database counting** capability
 
 ## Installation
 
@@ -127,72 +129,66 @@ python3 bountycatch.py [global-options] <command> [command-options]
 #### **Adding Domains**
 Import domains from a text file with automatic validation:
 ```bash
-python3 bountycatch.py add -p example-project -f domains.txt
+python3 bountycatch.py add -f domains.txt
 
 # Skip domain validation (not recommended)
-python3 bountycatch.py add -p example-project -f domains.txt --no-validate
+python3 bountycatch.py add -f domains.txt --no-validate
 ```
 
 #### **Counting Domains**
-Get the total number of domains in a project:
+Get the total number of domains in the database:
 ```bash
-python3 bountycatch.py count -p example-project
+python3 bountycatch.py count
 ```
 
 #### **Listing Domains**
 Print all domains in alphabetical order:
 ```bash
-python3 bountycatch.py print -p example-project
-```
-
-#### **Listing All Projects**
-View all projects stored in Redis:
-```bash
-python3 bountycatch.py projects
+python3 bountycatch.py print
 ```
 
 #### **Removing Domains**
 Remove domains that were added by mistake:
 ```bash
 # Remove a single domain
-python3 bountycatch.py remove -p example-project -d unwanted-domain.com
+python3 bountycatch.py remove -d unwanted-domain.com
 
 # Remove multiple domains from a file
-python3 bountycatch.py remove -p example-project -f domains_to_remove.txt
+python3 bountycatch.py remove -f domains_to_remove.txt
 ```
 
 #### **Exporting Domains**
 Export domains to various formats:
 ```bash
 # Export to text file (default)
-python3 bountycatch.py export -p example-project -f domains.txt
+python3 bountycatch.py export -f domains.txt
 
 # Export to JSON with metadata
-python3 bountycatch.py export -p example-project -f domains.json --format json
+python3 bountycatch.py export -f domains.json --format json
 ```
 
-#### **Deleting Projects**
-Remove a project and all its domains:
+#### **Deleting All Domains**
+Remove all domains from the database:
 ```bash
 # With confirmation prompt
-python3 bountycatch.py delete -p example-project
+python3 bountycatch.py delete-all
 
 # Skip confirmation (use with caution)
-python3 bountycatch.py delete -p example-project --confirm
+python3 bountycatch.py delete-all --confirm
 ```
 
 ### Other Usage
 
 #### **Custom Configuration**
 ```bash
-python3 bountycatch.py -c my-config.json -v add -p project -f domains.txt
+python3 bountycatch.py -c my-config.json -v add -f domains.txt
 ```
 
 #### **Batch Operations**
 ```bash
 # Process multiple files
 for file in *.txt; do
-    python3 bountycatch.py add -p "$(basename "$file" .txt)" -f "$file"
+  python3 bountycatch.py add -f "$file"
 done
 ```
 
@@ -214,10 +210,17 @@ mistake.org
 ```
 
 ### New: Validation Rules
-- Must be valid RFC-compliant domain names
-- No wildcards or protocols
-- Invalid domains are logged and skipped
+- Supported valid inputs:
+  - Leading wildcard: `*.example.com`
+  - Internal wildcard: `svc-*.domain.com`, `rac-*.net.dell.com`, `test.*.invalid.com`
+  - Service record (underscore): `_service.domain.com`, `_collab-edge.5g.dell.com`
+  - Standard domain/subdomain: `example.com`, `sub.domain.com`
+- Explicitly invalid and will be skipped:
+  - `*abc.com` (invalid leading wildcard without dot)
+  - `svc-*` (no TLD)
+  - `-.example.com` (invalid empty label)
 - Empty lines are ignored
+- Protocols (http://, https://) and paths are not supported and will be rejected
 
 ## Export Formats
 
@@ -231,7 +234,6 @@ subdomain.example.org
 ### JSON Format
 ```json
 {
-  "project": "example-project",
   "domain_count": 3,
   "exported_at": "2025-06-05T20:29:54.867184",
   "domains": [
@@ -267,8 +269,7 @@ subdomain.example.org
 - **File not found**: Graceful handling when removal file doesn't exist
 - **Statistics reporting**: Shows count of successfully removed vs. not found domains
 
-### Project Management
-- **Non-existent projects**: Clear error messages when referencing projects that don't exist
+### Database Management
 - **Redis connection issues**: Graceful failure with helpful error messages
 - **Invalid domain validation**: Automatic skipping with detailed logging
 

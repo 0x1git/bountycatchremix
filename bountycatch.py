@@ -23,74 +23,83 @@ class DataStore:
             self.logger.error(f"Failed to connect to Redis: {e}")
             raise
 
-    def add_domain(self, project: str, domain: str) -> int:
+    def add_domain(self, domain: str) -> int:
         try:
-            return self.r.sadd(project, domain)
+            return self.r.sadd('domains', domain)
         except redis.RedisError as e:
-            self.logger.error(f"Failed to add domain {domain} to project {project}: {e}")
+            self.logger.error(f"Failed to add domain {domain}: {e}")
             raise
 
-    def remove_domain(self, project: str, domain: str) -> int:
-        """Remove a domain from a project"""
+    def remove_domain(self, domain: str) -> int:
+        """Remove a domain from the database"""
         try:
-            return self.r.srem(project, domain)
+            return self.r.srem('domains', domain)
         except redis.RedisError as e:
-            self.logger.error(f"Failed to remove domain {domain} from project {project}: {e}")
+            self.logger.error(f"Failed to remove domain {domain}: {e}")
             raise
 
-    def get_domains(self, project: str) -> Set[bytes]:
+    def get_domains(self) -> Set[bytes]:
         try:
-            return self.r.smembers(project)
+            return self.r.smembers('domains')
         except redis.RedisError as e:
-            self.logger.error(f"Failed to get domains for project {project}: {e}")
+            self.logger.error(f"Failed to get domains: {e}")
             raise
 
-    def deduplicate(self, project):
+    def deduplicate(self):
         return True
 
-    def delete_project(self, project: str) -> int:
+    def delete_all_domains(self) -> int:
         try:
-            return self.r.delete(project)
+            return self.r.delete('domains')
         except redis.RedisError as e:
-            self.logger.error(f"Failed to delete project {project}: {e}")
+            self.logger.error(f"Failed to delete all domains: {e}")
             raise
     
-    def project_exists(self, project: str) -> bool:
+    def domains_exist(self) -> bool:
         try:
-            return bool(self.r.exists(project))
+            return bool(self.r.exists('domains'))
         except redis.RedisError as e:
-            self.logger.error(f"Failed to check if project {project} exists: {e}")
+            self.logger.error(f"Failed to check if domains exist: {e}")
             raise
 
-    def count_domains(self, project: str) -> int:
+    def count_domains(self) -> int:
         try:
-            return self.r.scard(project)
+            return self.r.scard('domains')
         except redis.RedisError as e:
-            self.logger.error(f"Failed to count domains for project {project}: {e}")
-            raise
-
-    def get_all_projects(self) -> Set[str]:
-        """Get all project names stored in Redis"""
-        try:
-            # Get all keys in Redis (project names)
-            raw_keys = self.r.keys('*')
-            return {key.decode('utf-8') for key in raw_keys}
-        except redis.RedisError as e:
-            self.logger.error(f"Failed to get all projects: {e}")
+            self.logger.error(f"Failed to count domains: {e}")
             raise
             
 class DomainValidator:
     
-    
+    # Single comprehensive regex pattern that handles all valid domain formats:
+    # - Leading wildcards: *.example.com
+    # - Internal wildcards: svc-*.domain.com, rac-*.net.dell.com, test.*.invalid.com
+    # - Service records: _service.domain.com, _collab-edge.5g.dell.com
+    # - Standard domains: example.com, sub.domain.com
     DOMAIN_PATTERN = re.compile(
-        r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)'
-        r'+[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
+        r'^(?:'
+        r'(?:\*\.)?'  # Optional leading wildcard: *.
+        r'(?:[a-zA-Z0-9_*](?:[a-zA-Z0-9_*-]{0,61}[a-zA-Z0-9_*])?\.)'  # Labels (allows * anywhere in label)
+        r'+'  # One or more labels
+        r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'  # TLD (no * or _ allowed)
+        r')$'
     )
     
     @classmethod
     def is_valid_domain(cls, domain: str) -> bool:
         if not domain or len(domain) > 253:
             return False
+        
+        # Check for invalid patterns that the regex might miss
+        if domain.startswith('*') and not domain.startswith('*.'):
+            return False  # *abc.com is invalid
+        
+        if domain.endswith('*') or domain == '*':
+            return False  # svc-* without TLD is invalid
+        
+        if '.-' in domain or '-.' in domain or domain.startswith('.') or domain.endswith('.'):
+            return False  # -.example.com and similar invalid patterns
+        
         return bool(cls.DOMAIN_PATTERN.match(domain))
 
 class ConfigManager:
@@ -144,24 +153,22 @@ class ConfigManager:
     def get_logging_config(self) -> Dict[str, Any]:
         return self.config['logging']
 
-class Project:
-    def __init__(self, datastore, name: str):
+class DomainManager:
+    def __init__(self, datastore):
         self.datastore = datastore
-        self.name = name
         self.logger = logging.getLogger(__name__)
     
     def export_domains(self, output_file: str, format_type: str = 'text') -> bool:
         try:
             domains = self.get_domains()
             if not domains:
-                self.logger.warning(f"No domains found in project '{self.name}'")
+                self.logger.warning("No domains found in database")
                 return False
             
             output_path = Path(output_file)
             
             if format_type.lower() == 'json':
                 export_data = {
-                    'project': self.name,
                     'domain_count': len(domains),
                     'exported_at': str(datetime.now().isoformat()),
                     'domains': sorted(list(domains))
@@ -185,6 +192,15 @@ class Project:
             self.logger.error(f"Failed to export domains: {e}")
             return False
 
+    def _process_domain(self, domain: str) -> str:
+        """Process domain to handle special cases while keeping them valid for storage."""
+        # Remove any leading/trailing whitespace
+        domain = domain.strip()
+        
+        # Domain is stored as-is since our validator now accepts these patterns
+        # No sanitization needed - we want to preserve the original format
+        return domain
+
     def add_domains_from_file(self, filename: str, validate: bool = True) -> None:
         file_path = Path(filename)
         if not file_path.exists():
@@ -202,17 +218,21 @@ class Project:
                     if not domain:
                         continue
                     
-                    if validate and not DomainValidator.is_valid_domain(domain):
+                    processed_domain = self._process_domain(domain)
+                    
+                    if validate and not DomainValidator.is_valid_domain(processed_domain):
                         self.logger.warning(f"Invalid domain '{domain}' on line {line_num}, skipping")
                         invalid_domains += 1
                         continue
                     
                     try:
-                        added = self.datastore.add_domain(self.name, domain)
+                        added = self.datastore.add_domain(processed_domain)
                         new_domains += added
                         total_domains += 1
+                        if domain != processed_domain:
+                            self.logger.debug(f"Processed domain '{domain}' as '{processed_domain}'")
                     except redis.RedisError as e:
-                        self.logger.error(f"Failed to add domain '{domain}': {e}")
+                        self.logger.error(f"Failed to add domain '{processed_domain}': {e}")
                 
                 duplicate_domains = total_domains - new_domains
                 duplicate_percentage = (duplicate_domains / total_domains * 100) if total_domains > 0 else 0
@@ -228,7 +248,7 @@ class Project:
             self.logger.error(f"Failed to read file {filename}: {e}")
 
     def remove_domains_from_file(self, filename: str) -> None:
-        """Remove domains listed in a file from the project"""
+        """Remove domains listed in a file from the database"""
         file_path = Path(filename)
         if not file_path.exists():
             self.logger.error(f"File {filename} does not exist")
@@ -246,12 +266,12 @@ class Project:
                         continue
                     
                     try:
-                        removed = self.datastore.remove_domain(self.name, domain)
+                        removed = self.datastore.remove_domain(domain)
                         if removed > 0:
                             removed_domains += 1
                         else:
                             not_found_domains += 1
-                            self.logger.warning(f"Domain '{domain}' not found in project '{self.name}'")
+                            self.logger.warning(f"Domain '{domain}' not found in database")
                         total_domains += 1
                     except redis.RedisError as e:
                         self.logger.error(f"Failed to remove domain '{domain}': {e}")
@@ -265,14 +285,14 @@ class Project:
             self.logger.error(f"Failed to read file {filename}: {e}")
 
     def remove_domain(self, domain: str) -> bool:
-        """Remove a single domain from the project"""
+        """Remove a single domain from the database"""
         try:
-            removed = self.datastore.remove_domain(self.name, domain)
+            removed = self.datastore.remove_domain(domain)
             if removed > 0:
-                self.logger.info(f"Removed domain '{domain}' from project '{self.name}'")
+                self.logger.info(f"Removed domain '{domain}' from database")
                 return True
             else:
-                self.logger.warning(f"Domain '{domain}' not found in project '{self.name}'")
+                self.logger.warning(f"Domain '{domain}' not found in database")
                 return False
         except redis.RedisError as e:
             self.logger.error(f"Failed to remove domain '{domain}': {e}")
@@ -280,7 +300,7 @@ class Project:
 
     def get_domains(self) -> Set[str]:
         try:
-            raw_domains = self.datastore.get_domains(self.name)
+            raw_domains = self.datastore.get_domains()
             return {domain.decode('utf-8') for domain in raw_domains}
         except redis.RedisError as e:
             self.logger.error(f"Failed to get domains: {e}")
@@ -288,43 +308,34 @@ class Project:
     
     def count_domains(self) -> Optional[int]:
         try:
-            if not self.datastore.project_exists(self.name):
-                self.logger.error(f"Project '{self.name}' does not exist")
+            if not self.datastore.domains_exist():
+                self.logger.error("No domains exist in database")
                 return None
             
-            count = self.datastore.count_domains(self.name)
-            self.logger.info(f"Project '{self.name}' contains {count} domains")
+            count = self.datastore.count_domains()
+            self.logger.info(f"Database contains {count} domains")
             return count
         except redis.RedisError as e:
             self.logger.error(f"Failed to count domains: {e}")
             return None
 
     def deduplicate(self) -> bool:
-        return self.datastore.deduplicate(self.name)
+        return self.datastore.deduplicate()
     
-    def delete(self) -> bool:
+    def delete_all(self) -> bool:
         try:
-            self.logger.info(f"Attempting to delete project '{self.name}'")
-            deleted_count = self.datastore.delete_project(self.name)
+            self.logger.info("Attempting to delete all domains")
+            deleted_count = self.datastore.delete_all_domains()
             
             if deleted_count == 0:
-                self.logger.warning(f"Project '{self.name}' did not exist")
+                self.logger.warning("No domains existed in database")
                 return False
             else:
-                self.logger.info(f"Project '{self.name}' deleted successfully")
+                self.logger.info("All domains deleted successfully")
                 return True
         except redis.RedisError as e:
-            self.logger.error(f"Failed to delete project: {e}")
+            self.logger.error(f"Failed to delete all domains: {e}")
             return False
-
-    @classmethod
-    def get_all_projects(cls, datastore) -> Set[str]:
-        """Get all project names from the datastore"""
-        try:
-            return datastore.get_all_projects()
-        except redis.RedisError as e:
-            logging.getLogger(__name__).error(f"Failed to get all projects: {e}")
-            return set()
 
 def setup_logging(config: ConfigManager) -> None:
     logging_config = config.get_logging_config()
@@ -341,46 +352,38 @@ def setup_logging(config: ConfigManager) -> None:
 def main():
     parser = argparse.ArgumentParser(
         description="Manage bug bounty targets",
-        formatter_class=argparse.RawDescriptionHelpFormatter,        epilog="""
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 Examples:
-  %(prog)s add -p myproject -f domains.txt
-  %(prog)s export -p myproject -f output.json --format json
-  %(prog)s count -p myproject
-  %(prog)s projects
-  %(prog)s remove -p myproject -f domains_to_remove.txt
-  %(prog)s remove -p myproject -d example.com
-  %(prog)s delete -p myproject
+  %(prog)s add -f domains.txt
+  %(prog)s export -f output.json --format json
+  %(prog)s count
+  %(prog)s remove -f domains_to_remove.txt
+  %(prog)s remove -d example.com
+  %(prog)s delete-all
         """
     )
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     add_parser = subparsers.add_parser('add', help='Add domains from file')
-    add_parser.add_argument('-p', '--project', required=True, help='Project name')
     add_parser.add_argument('-f', '--file', required=True, help='File containing domains')
     add_parser.add_argument('--no-validate', action='store_true', help='Skip domain validation')
     
     export_parser = subparsers.add_parser('export', help='Export domains to file')
-    export_parser.add_argument('-p', '--project', required=True, help='Project name')
     export_parser.add_argument('-f', '--file', required=True, help='Output file')
     export_parser.add_argument('--format', choices=['text', 'json'], default='text', help='Export format')
     
     print_parser = subparsers.add_parser('print', help='Print all domains')
-    print_parser.add_argument('-p', '--project', required=True, help='Project name')
     
-    count_parser = subparsers.add_parser('count', help='Count domains in project')
-    count_parser.add_argument('-p', '--project', required=True, help='Project name')
+    count_parser = subparsers.add_parser('count', help='Count domains in database')
     
-    projects_parser = subparsers.add_parser('projects', help='List all project names')
-    
-    remove_parser = subparsers.add_parser('remove', help='Remove domains from project')
-    remove_parser.add_argument('-p', '--project', required=True, help='Project name')
+    remove_parser = subparsers.add_parser('remove', help='Remove domains from database')
     remove_group = remove_parser.add_mutually_exclusive_group(required=True)
     remove_group.add_argument('-f', '--file', help='File containing domains to remove')
     remove_group.add_argument('-d', '--domain', help='Single domain to remove')
     
-    delete_parser = subparsers.add_parser('delete', help='Delete project')
-    delete_parser.add_argument('-p', '--project', required=True, help='Project name')
+    delete_parser = subparsers.add_parser('delete-all', help='Delete all domains')
     delete_parser.add_argument('--confirm', action='store_true', help='Skip confirmation prompt')
     
     parser.add_argument('-c', '--config', help='Configuration file path')
@@ -403,9 +406,7 @@ Examples:
     try:
         redis_config = config.get_redis_config()
         datastore = DataStore(**redis_config)
-          # Only create project object if command requires it
-        if args.command in ['add', 'export', 'print', 'count', 'remove', 'delete']:
-            project = Project(datastore, args.project)
+        domain_manager = DomainManager(datastore)
         
     except redis.ConnectionError:
         logger.error("Failed to connect to Redis. Please check your Redis server is running.")
@@ -416,54 +417,46 @@ Examples:
 
     if args.command == 'add':
         validate = not args.no_validate
-        project.add_domains_from_file(args.file, validate=validate)
-        project.deduplicate()
+        domain_manager.add_domains_from_file(args.file, validate=validate)
+        domain_manager.deduplicate()
         
     elif args.command == 'export':
-        if not project.export_domains(args.file, args.format):
+        if not domain_manager.export_domains(args.file, args.format):
             return 1
             
     elif args.command == 'print':
-        domains = project.get_domains()
+        domains = domain_manager.get_domains()
         if not domains:
-            logger.warning(f"No domains found in project '{args.project}'")
+            logger.warning("No domains found in database")
         else:
             for domain in sorted(domains):
                 print(domain)
                 
     elif args.command == 'count':
-        count = project.count_domains()
+        count = domain_manager.count_domains()
         if count is not None:
             print(f"{count}")
         else:
             return 1
-            
-    elif args.command == 'projects':
-        projects = Project.get_all_projects(datastore)
-        if not projects:
-            logger.warning("No projects found in Redis")
-        else:
-            for project_name in sorted(projects):
-                print(project_name)
     
     elif args.command == 'remove':
         if args.file:
-            project.remove_domains_from_file(args.file)
+            domain_manager.remove_domains_from_file(args.file)
         elif args.domain:
-            if project.remove_domain(args.domain):
-                print(f"Domain '{args.domain}' removed from project '{args.project}'")
+            if domain_manager.remove_domain(args.domain):
+                print(f"Domain '{args.domain}' removed from database")
             else:
                 return 1
             
-    elif args.command == 'delete':
+    elif args.command == 'delete-all':
         if not args.confirm:
-            response = input(f"Are you sure you want to delete project '{args.project}'? (y/N): ")
+            response = input("Are you sure you want to delete ALL domains from the database? (y/N): ")
             if response.lower() not in ['y', 'yes']:
                 logger.info("Delete operation cancelled")
                 return 0
         
-        if project.delete():
-            print(f"Project '{args.project}' deleted successfully")
+        if domain_manager.delete_all():
+            print("All domains deleted successfully")
         else:
             return 1
     
