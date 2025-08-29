@@ -429,8 +429,12 @@ Examples:
         if not domains:
             logger.warning("No domains found in database")
         else:
-            for domain in sorted(domains):
-                print(domain)
+            try:
+                for domain in sorted(domains):
+                    print(domain)
+            except BrokenPipeError:
+                # Handle broken pipe gracefully when piping to head, etc.
+                pass
                 
     elif args.command == 'count':
         count = domain_manager.count_domains()
@@ -463,12 +467,16 @@ Examples:
     return 0
 
 if __name__ == '__main__':
+    import sys
     try:
         exit_code = main()
-        exit(exit_code or 0)
+        sys.exit(exit_code or 0)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")
-        exit(1)
+        sys.exit(1)
+    except BrokenPipeError:
+        # Handle broken pipe gracefully (e.g., when piping to head)
+        sys.exit(0)
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
-        exit(1)
+        sys.exit(1)
