@@ -157,6 +157,39 @@ class DomainManager:
     def __init__(self, datastore):
         self.datastore = datastore
         self.logger = logging.getLogger(__name__)
+
+    def iter_domains(self, match: Optional[str] = None, regex: Optional[re.Pattern] = None, sort: bool = False, batch_size: int = 1000):
+        """Stream domains from Redis using SSCAN to reduce latency and memory use.
+
+        If sort is False (default), yields in scan order (faster, low memory).
+        If sort is True, collects then sorts before yielding (slower, higher memory).
+        """
+        if sort:
+            # Fall back to existing get_domains + sort when explicit sort is requested
+            domains = self.get_domains()
+            if match:
+                domains = {d for d in domains if match in d}
+            if regex:
+                domains = {d for d in domains if regex.search(d)}
+            for d in sorted(domains):
+                yield d
+            return
+
+        cursor = 0
+        while True:
+            cursor, batch = self.datastore.r.sscan('domains', cursor=cursor, count=batch_size)
+            if not batch:
+                if cursor == 0:
+                    break
+            for raw in batch:
+                d = raw.decode('utf-8')
+                if match and match not in d:
+                    continue
+                if regex and not regex.search(d):
+                    continue
+                yield d
+            if cursor == 0:
+                break
     
     def export_domains(self, output_file: str, format_type: str = 'text') -> bool:
         try:
@@ -355,12 +388,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s add -f domains.txt
-  %(prog)s export -f output.json --format json
-  %(prog)s count
-  %(prog)s remove -f domains_to_remove.txt
-  %(prog)s remove -d example.com
-  %(prog)s delete-all
+    add    : %(prog)s add -f domains.txt
+             %(prog)s add -f raw.txt --no-validate
+    export : %(prog)s export -f out.json --format json --match .dell.com
+    count  : %(prog)s count --regex '.*\\.dell\\.com$'
+    print  : %(prog)s print --match .dell.com --sort
+    remove : %(prog)s remove --match .dell.com
+    delete : %(prog)s delete-all
+
+Filter flags (where supported):
+    --match SUBSTR   substring filter
+    --regex PATTERN  regex filter
+    --sort           sorted output (print/export only; slower)
         """
     )
     
@@ -370,18 +409,31 @@ Examples:
     add_parser.add_argument('-f', '--file', required=True, help='File containing domains')
     add_parser.add_argument('--no-validate', action='store_true', help='Skip domain validation')
     
-    export_parser = subparsers.add_parser('export', help='Export domains to file')
+    export_parser = subparsers.add_parser('export', help='Export domains to file (supports filtering)')
     export_parser.add_argument('-f', '--file', required=True, help='Output file')
     export_parser.add_argument('--format', choices=['text', 'json'], default='text', help='Export format')
+    export_filter = export_parser.add_mutually_exclusive_group()
+    export_filter.add_argument('--match', help='Filter domains containing this substring')
+    export_filter.add_argument('--regex', help='Filter domains matching this regex')
+    export_parser.add_argument('--sort', action='store_true', help='Sort domains before exporting (slower)')
     
-    print_parser = subparsers.add_parser('print', help='Print all domains')
+    print_parser = subparsers.add_parser('print', help='Print domains (supports filtering)')
+    print_filter = print_parser.add_mutually_exclusive_group()
+    print_filter.add_argument('--match', help='Filter domains containing this substring')
+    print_filter.add_argument('--regex', help='Filter domains matching this regex')
+    print_parser.add_argument('--sort', action='store_true', help='Sort domains before printing (slower)')
     
-    count_parser = subparsers.add_parser('count', help='Count domains in database')
+    count_parser = subparsers.add_parser('count', help='Count domains in database (supports filtering)')
+    count_filter = count_parser.add_mutually_exclusive_group()
+    count_filter.add_argument('--match', help='Filter domains containing this substring before counting')
+    count_filter.add_argument('--regex', help='Filter domains matching this regex before counting')
     
-    remove_parser = subparsers.add_parser('remove', help='Remove domains from database')
+    remove_parser = subparsers.add_parser('remove', help='Remove domains from database (supports filtering)')
     remove_group = remove_parser.add_mutually_exclusive_group(required=True)
     remove_group.add_argument('-f', '--file', help='File containing domains to remove')
     remove_group.add_argument('-d', '--domain', help='Single domain to remove')
+    remove_group.add_argument('--match', help='Remove domains containing this substring')
+    remove_group.add_argument('--regex', help='Remove domains matching this regex')
     
     delete_parser = subparsers.add_parser('delete-all', help='Delete all domains')
     delete_parser.add_argument('--confirm', action='store_true', help='Skip confirmation prompt')
@@ -402,6 +454,15 @@ Examples:
     
     setup_logging(config)
     logger = logging.getLogger(__name__)
+
+    def compile_regex(pattern_str: Optional[str]):
+        if not pattern_str:
+            return None
+        try:
+            return re.compile(pattern_str)
+        except re.error as e:
+            logger.error(f"Invalid regex '{pattern_str}': {e}")
+            return None
     
     try:
         redis_config = config.get_redis_config()
@@ -421,26 +482,64 @@ Examples:
         domain_manager.deduplicate()
         
     elif args.command == 'export':
-        if not domain_manager.export_domains(args.file, args.format):
+        pattern = compile_regex(args.regex)
+        if args.regex and pattern is None:
+            return 1
+
+        count_written = 0
+        try:
+            if args.format == 'json':
+                domains = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort))
+                export_data = {
+                    'domain_count': len(domains),
+                    'exported_at': str(datetime.now().isoformat()),
+                    'domains': domains if not args.sort else sorted(domains)
+                }
+                with open(args.file, 'w') as f:
+                    json.dump(export_data, f, indent=2)
+                count_written = export_data['domain_count']
+            else:
+                # text export, stream to file to reduce memory
+                with open(args.file, 'w') as f:
+                    domains_iter = domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort)
+                    for d in domains_iter:
+                        f.write(f"{d}\n")
+                        count_written += 1
+            logger.info(f"Exported {count_written} domains to {args.file} ({args.format} format)")
+        except (IOError, json.JSONEncodeError) as e:
+            logger.error(f"Failed to export domains: {e}")
             return 1
             
     elif args.command == 'print':
-        domains = domain_manager.get_domains()
-        if not domains:
+        pattern = compile_regex(args.regex)
+        if args.regex and pattern is None:
+            return 1
+
+        # Stream via SSCAN to reduce startup latency and memory usage
+        found_any = False
+        try:
+            for domain in domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort):
+                found_any = True
+                print(domain)
+        except BrokenPipeError:
+            # Handle broken pipe gracefully when piping to head, etc.
+            pass
+
+        if not found_any:
             logger.warning("No domains found in database")
-        else:
-            try:
-                for domain in sorted(domains):
-                    print(domain)
-            except BrokenPipeError:
-                # Handle broken pipe gracefully when piping to head, etc.
-                pass
                 
     elif args.command == 'count':
-        count = domain_manager.count_domains()
-        if count is not None:
-            print(f"{count}")
-        else:
+        pattern = compile_regex(args.regex)
+        if args.regex and pattern is None:
+            return 1
+
+        total = 0
+        try:
+            for _ in domain_manager.iter_domains(match=args.match, regex=pattern, sort=False):
+                total += 1
+            print(f"{total}")
+        except redis.RedisError as e:
+            logger.error(f"Failed to count domains: {e}")
             return 1
     
     elif args.command == 'remove':
@@ -451,6 +550,22 @@ Examples:
                 print(f"Domain '{args.domain}' removed from database")
             else:
                 return 1
+        elif args.match or args.regex:
+            pattern = compile_regex(args.regex)
+            if args.regex and pattern is None:
+                return 1
+            removed = 0
+            try:
+                # Collect candidates then remove to avoid modifying set during scan
+                to_remove = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=False))
+                for d in to_remove:
+                    removed += domain_manager.datastore.remove_domain(d)
+                logger.info(f"Removed {removed} domains using filter")
+            except redis.RedisError as e:
+                logger.error(f"Failed to remove domains with filter: {e}")
+                return 1
+        else:
+            return 1
             
     elif args.command == 'delete-all':
         if not args.confirm:
