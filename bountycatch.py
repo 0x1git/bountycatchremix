@@ -158,7 +158,7 @@ class DomainManager:
         self.datastore = datastore
         self.logger = logging.getLogger(__name__)
 
-    def iter_domains(self, match: Optional[str] = None, regex: Optional[re.Pattern] = None, sort: bool = False, batch_size: int = 1000):
+    def iter_domains(self, match: Optional[str] = None, regex: Optional[re.Pattern] = None, sort: bool = False, batch_size: int = 500000):
         """Stream domains from Redis using SSCAN to reduce latency and memory use.
 
         If sort is False (default), yields in scan order (faster, low memory).
@@ -234,13 +234,15 @@ class DomainManager:
         # No sanitization needed - we want to preserve the original format
         return domain
 
-    def add_domains_from_file(self, filename: str, validate: bool = True) -> None:
+    def add_domains_from_file(self, filename: str, validate: bool = True, batch_size: int = 500000) -> None:
         file_path = Path(filename)
         if not file_path.exists():
             self.logger.error(f"File {filename} does not exist")
             return
         
         try:
+            pipeline = self.datastore.r.pipeline(transaction=False)
+            batch: list[str] = []
             with open(file_path, 'r') as file:
                 total_domains = 0
                 new_domains = 0
@@ -258,14 +260,29 @@ class DomainManager:
                         invalid_domains += 1
                         continue
                     
-                    try:
-                        added = self.datastore.add_domain(processed_domain)
-                        new_domains += added
-                        total_domains += 1
-                        if domain != processed_domain:
-                            self.logger.debug(f"Processed domain '{domain}' as '{processed_domain}'")
-                    except redis.RedisError as e:
-                        self.logger.error(f"Failed to add domain '{processed_domain}': {e}")
+                    batch.append(processed_domain)
+                    total_domains += 1
+
+                    if len(batch) >= batch_size:
+                        try:
+                            added = pipeline.sadd('domains', *batch)
+                            pipeline_results = pipeline.execute()
+                            # pipeline_results is a list; we expect a single int for SADD
+                            if pipeline_results:
+                                new_domains += pipeline_results[-1]
+                        except redis.RedisError as e:
+                            self.logger.error(f"Failed to add batch: {e}")
+                        batch.clear()
+            # Flush remaining batch
+            if batch:
+                try:
+                    added = pipeline.sadd('domains', *batch)
+                    pipeline_results = pipeline.execute()
+                    if pipeline_results:
+                        new_domains += pipeline_results[-1]
+                except redis.RedisError as e:
+                    self.logger.error(f"Failed to add final batch: {e}")
+                batch.clear()
                 
                 duplicate_domains = total_domains - new_domains
                 duplicate_percentage = (duplicate_domains / total_domains * 100) if total_domains > 0 else 0
@@ -370,16 +387,16 @@ class DomainManager:
             self.logger.error(f"Failed to delete all domains: {e}")
             return False
 
-def setup_logging(config: ConfigManager) -> None:
+def setup_logging(config: ConfigManager, silent: bool = False) -> None:
     logging_config = config.get_logging_config()
-    
+    handlers = [logging.FileHandler('bountycatch.log')]
+    if not silent:
+        handlers.insert(0, logging.StreamHandler())
+
     logging.basicConfig(
         level=getattr(logging, logging_config['level']),
         format=logging_config['format'],
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('bountycatch.log')
-        ]
+        handlers=handlers
     )
 
 def main():
@@ -395,6 +412,7 @@ Examples:
     print  : %(prog)s print --match .dell.com --sort
     remove : %(prog)s remove --match .dell.com
     delete : %(prog)s delete-all
+    silent : %(prog)s print --match .dell.com --silent
 
 Filter flags (where supported):
     --match SUBSTR   substring filter
@@ -440,6 +458,7 @@ Filter flags (where supported):
     
     parser.add_argument('-c', '--config', help='Configuration file path')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('-s', '--silent', action='store_true', help='Suppress console logs; only emit command output')
     
     args = parser.parse_args()
     
@@ -452,7 +471,7 @@ Filter flags (where supported):
     if args.verbose:
         config.config['logging']['level'] = 'DEBUG'
     
-    setup_logging(config)
+    setup_logging(config, silent=args.silent)
     logger = logging.getLogger(__name__)
 
     def compile_regex(pattern_str: Optional[str]):

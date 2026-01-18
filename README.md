@@ -127,12 +127,9 @@ python3 bountycatch.py [global-options] <command> [command-options]
 ### Commands
 
 #### **Adding Domains**
-Import domains from a text file with automatic validation:
+Import domains from a text file (invalid domains are skipped with a warning):
 ```bash
 python3 bountycatch.py add -f domains.txt
-
-# Skip domain validation (not recommended)
-python3 bountycatch.py add -f domains.txt --no-validate
 ```
 
 #### **Counting Domains**
