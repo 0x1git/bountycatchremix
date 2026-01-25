@@ -88,11 +88,6 @@ pip install -r requirements.txt
 
 ## Configuration
 
-## Add in ~/.bashrc
-```
-alias bountycatch='python3 ~/tools/bountycatchremix/bountycatch.py'
-```
-
 ### Default Configuration
 Create `config.json` for custom Redis settings:
 ```json
