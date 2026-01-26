@@ -2,6 +2,7 @@
 import argparse
 import redis
 import os
+import sys
 import json
 import logging
 import re
@@ -235,6 +236,64 @@ class DomainManager:
         # No sanitization needed - we want to preserve the original format
         return domain
 
+    def add_domains_from_stream(self, stream, validate: bool = True, batch_size: int = 500000) -> None:
+        """Add domains from any file-like stream (stdin, file handle, etc.)"""
+        try:
+            pipeline = self.datastore.r.pipeline(transaction=False)
+            batch: list[str] = []
+            total_domains = 0
+            new_domains = 0
+            invalid_domains = 0
+            
+            for line_num, line in enumerate(stream, 1):
+                domain = line.strip()
+                if not domain:
+                    continue
+                
+                processed_domain = self._process_domain(domain)
+                
+                if validate and not DomainValidator.is_valid_domain(processed_domain):
+                    self.logger.warning(f"Invalid domain '{domain}' on line {line_num}, skipping")
+                    invalid_domains += 1
+                    continue
+                
+                batch.append(processed_domain)
+                total_domains += 1
+
+                if len(batch) >= batch_size:
+                    try:
+                        pipeline.sadd('domains', *batch)
+                        pipeline_results = pipeline.execute()
+                        if pipeline_results:
+                            new_domains += pipeline_results[-1]
+                    except redis.RedisError as e:
+                        self.logger.error(f"Failed to add batch: {e}")
+                    batch.clear()
+            
+            # Flush remaining batch
+            if batch:
+                try:
+                    pipeline.sadd('domains', *batch)
+                    pipeline_results = pipeline.execute()
+                    if pipeline_results:
+                        new_domains += pipeline_results[-1]
+                except redis.RedisError as e:
+                    self.logger.error(f"Failed to add final batch: {e}")
+                batch.clear()
+            
+            duplicate_domains = total_domains - new_domains
+            duplicate_percentage = (duplicate_domains / total_domains * 100) if total_domains > 0 else 0
+            
+            self.logger.info(
+                f"Processed {total_domains} domains: {new_domains} new, "
+                f"{duplicate_domains} duplicates ({duplicate_percentage:.2f}%)"
+            )
+            if invalid_domains > 0:
+                self.logger.warning(f"Skipped {invalid_domains} invalid domains")
+                
+        except IOError as e:
+            self.logger.error(f"Failed to read stream: {e}")
+
     def add_domains_from_file(self, filename: str, validate: bool = True, batch_size: int = 500000) -> None:
         file_path = Path(filename)
         if not file_path.exists():
@@ -424,8 +483,8 @@ Filter flags (where supported):
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    add_parser = subparsers.add_parser('add', help='Add domains from file')
-    add_parser.add_argument('-f', '--file', required=True, help='File containing domains')
+    add_parser = subparsers.add_parser('add', help='Add domains from file or stdin')
+    add_parser.add_argument('-f', '--file', help='File containing domains (reads stdin if omitted)')
     add_parser.add_argument('--no-validate', action='store_true', help='Skip domain validation')
     
     export_parser = subparsers.add_parser('export', help='Export domains to file (supports filtering)')
@@ -498,7 +557,11 @@ Filter flags (where supported):
 
     if args.command == 'add':
         validate = not args.no_validate
-        domain_manager.add_domains_from_file(args.file, validate=validate)
+        if args.file:
+            domain_manager.add_domains_from_file(args.file, validate=validate)
+        else:
+            # Read from stdin
+            domain_manager.add_domains_from_stream(sys.stdin, validate=validate)
         domain_manager.deduplicate()
         
     elif args.command == 'export':
