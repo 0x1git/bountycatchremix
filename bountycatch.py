@@ -1,76 +1,216 @@
 #!/usr/bin/env python3
 import argparse
-import redis
+import psycopg2
+from psycopg2 import pool, sql
+from psycopg2.extras import execute_values
 import os
 import sys
 import json
 import logging
 import re
 from datetime import datetime
-from typing import Optional, Set, Dict, Any
+from typing import Optional, Set, Dict, Any, Iterator
 from pathlib import Path
 
+
 class DataStore:
-    def __init__(self, host='localhost', port=6379, db=0, max_connections=10):
-        self.pool = redis.ConnectionPool(
-            host=host, port=port, db=db, max_connections=max_connections
-        )
-        self.r = redis.Redis(connection_pool=self.pool)
+    def __init__(self, host='localhost', port=5432, database='bountycatch', user='postgres', password='', min_connections=1, max_connections=10):
         self.logger = logging.getLogger(__name__)
         
         try:
-            self.r.ping()
-            self.logger.info(f"Connected to Redis at {host}:{port}")
-        except redis.ConnectionError as e:
-            self.logger.error(f"Failed to connect to Redis: {e}")
+            self.pool = pool.ThreadedConnectionPool(
+                min_connections,
+                max_connections,
+                host=host,
+                port=port,
+                database=database,
+                user=user,
+                password=password
+            )
+            self.logger.info(f"Connected to PostgreSQL at {host}:{port}/{database}")
+            self._init_schema()
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to connect to PostgreSQL: {e}")
             raise
+
+    def _init_schema(self):
+        """Create the domains table if it doesn't exist"""
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS domains (
+                        domain TEXT PRIMARY KEY
+                    )
+                """)
+                # Create index for faster LIKE queries
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_domains_domain 
+                    ON domains (domain text_pattern_ops)
+                """)
+            conn.commit()
+        finally:
+            self.pool.putconn(conn)
 
     def add_domain(self, domain: str) -> int:
+        """Add a single domain. Returns 1 if inserted, 0 if duplicate."""
+        conn = self.pool.getconn()
         try:
-            return self.r.sadd('domains', domain)
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO domains (domain) VALUES (%s) ON CONFLICT DO NOTHING",
+                    (domain,)
+                )
+                conn.commit()
+                return cur.rowcount
+        except psycopg2.Error as e:
+            conn.rollback()
             self.logger.error(f"Failed to add domain {domain}: {e}")
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    def add_domains_batch(self, domains: list) -> int:
+        """Add multiple domains in a batch. Returns count of newly inserted."""
+        if not domains:
+            return 0
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    "INSERT INTO domains (domain) VALUES %s ON CONFLICT DO NOTHING",
+                    [(d,) for d in domains],
+                    page_size=10000
+                )
+                conn.commit()
+                return cur.rowcount
+        except psycopg2.Error as e:
+            conn.rollback()
+            self.logger.error(f"Failed to add batch: {e}")
+            raise
+        finally:
+            self.pool.putconn(conn)
 
     def remove_domain(self, domain: str) -> int:
-        """Remove a domain from the database"""
+        """Remove a domain. Returns 1 if removed, 0 if not found."""
+        conn = self.pool.getconn()
         try:
-            return self.r.srem('domains', domain)
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM domains WHERE domain = %s", (domain,))
+                conn.commit()
+                return cur.rowcount
+        except psycopg2.Error as e:
+            conn.rollback()
             self.logger.error(f"Failed to remove domain {domain}: {e}")
             raise
+        finally:
+            self.pool.putconn(conn)
 
-    def get_domains(self) -> Set[bytes]:
+    def remove_domains_batch(self, domains: list) -> int:
+        """Remove multiple domains. Returns count of removed."""
+        if not domains:
+            return 0
+        conn = self.pool.getconn()
         try:
-            return self.r.smembers('domains')
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    "DELETE FROM domains WHERE domain IN (VALUES %s)",
+                    [(d,) for d in domains],
+                    template="(%s)",
+                    page_size=10000
+                )
+                conn.commit()
+                return cur.rowcount
+        except psycopg2.Error as e:
+            conn.rollback()
+            self.logger.error(f"Failed to remove batch: {e}")
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def get_domains(self) -> Set[str]:
+        """Get all domains as a set."""
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT domain FROM domains")
+                return {row[0] for row in cur.fetchall()}
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to get domains: {e}")
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    def iter_domains(self, batch_size: int = 500000) -> Iterator[str]:
+        """Stream domains using server-side cursor."""
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor(name='domain_cursor') as cur:
+                cur.itersize = batch_size
+                cur.execute("SELECT domain FROM domains")
+                for row in cur:
+                    yield row[0]
+        except psycopg2.Error as e:
+            self.logger.error(f"Failed to iterate domains: {e}")
+            raise
+        finally:
+            self.pool.putconn(conn)
 
     def deduplicate(self):
+        """No-op for PostgreSQL as uniqueness is enforced by PRIMARY KEY."""
         return True
 
     def delete_all_domains(self) -> int:
+        """Delete all domains. Returns 1 if table had data, 0 otherwise."""
+        conn = self.pool.getconn()
         try:
-            return self.r.delete('domains')
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                cur.execute("SELECT EXISTS(SELECT 1 FROM domains LIMIT 1)")
+                had_data = cur.fetchone()[0]
+                cur.execute("TRUNCATE TABLE domains")
+                conn.commit()
+                return 1 if had_data else 0
+        except psycopg2.Error as e:
+            conn.rollback()
             self.logger.error(f"Failed to delete all domains: {e}")
             raise
-    
+        finally:
+            self.pool.putconn(conn)
+
     def domains_exist(self) -> bool:
+        """Check if any domains exist."""
+        conn = self.pool.getconn()
         try:
-            return bool(self.r.exists('domains'))
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                cur.execute("SELECT EXISTS(SELECT 1 FROM domains LIMIT 1)")
+                return cur.fetchone()[0]
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to check if domains exist: {e}")
             raise
+        finally:
+            self.pool.putconn(conn)
 
     def count_domains(self) -> int:
+        """Count total domains."""
+        conn = self.pool.getconn()
         try:
-            return self.r.scard('domains')
-        except redis.RedisError as e:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM domains")
+                return cur.fetchone()[0]
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to count domains: {e}")
             raise
-            
+        finally:
+            self.pool.putconn(conn)
+
+    def close(self):
+        """Close the connection pool."""
+        if hasattr(self, 'pool'):
+            self.pool.closeall()
+
+
 class DomainValidator:
     
     # Single comprehensive regex pattern that handles all valid domain formats:
@@ -104,6 +244,7 @@ class DomainValidator:
         
         return bool(cls.DOMAIN_PATTERN.match(domain))
 
+
 class ConfigManager:
     
     def __init__(self, config_file: Optional[str] = None):
@@ -112,10 +253,13 @@ class ConfigManager:
     
     def _load_config(self, config_file: Optional[str]) -> Dict[str, Any]:
         default_config = {
-            'redis': {
+            'postgresql': {
                 'host': 'localhost',
-                'port': 6379,
-                'db': 0,
+                'port': 5432,
+                'database': 'bountycatch',
+                'user': 'postgres',
+                'password': '',
+                'min_connections': 1,
                 'max_connections': 10
             },
             'logging': {
@@ -123,6 +267,19 @@ class ConfigManager:
                 'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             }
         }
+        
+        # Auto-detect config file from standard locations if not specified
+        if not config_file:
+            config_search_paths = [
+                Path.home() / '.config' / 'bountycatch' / 'config.json',  # XDG standard
+                Path.home() / '.bountycatch' / 'config.json',              # Home directory
+                Path('/etc/bountycatch/config.json'),                      # System-wide
+                Path(__file__).parent.resolve() / 'config.json',           # Script directory (dev)
+            ]
+            for path in config_search_paths:
+                if path.exists():
+                    config_file = str(path)
+                    break
         
         if config_file and Path(config_file).exists():
             try:
@@ -136,38 +293,52 @@ class ConfigManager:
             except (json.JSONDecodeError, IOError) as e:
                 logging.warning(f"Failed to load config file {config_file}: {e}")
         
-        redis_host = os.getenv('REDIS_HOST')
-        if redis_host:
-            default_config['redis']['host'] = redis_host
+        # Environment variable overrides
+        pg_host = os.getenv('PGHOST')
+        if pg_host:
+            default_config['postgresql']['host'] = pg_host
         
-        redis_port = os.getenv('REDIS_PORT')
-        if redis_port:
+        pg_port = os.getenv('PGPORT')
+        if pg_port:
             try:
-                default_config['redis']['port'] = int(redis_port)
+                default_config['postgresql']['port'] = int(pg_port)
             except ValueError:
-                logging.warning(f"Invalid REDIS_PORT value: {redis_port}")
+                logging.warning(f"Invalid PGPORT value: {pg_port}")
+
+        pg_database = os.getenv('PGDATABASE')
+        if pg_database:
+            default_config['postgresql']['database'] = pg_database
+        
+        pg_user = os.getenv('PGUSER')
+        if pg_user:
+            default_config['postgresql']['user'] = pg_user
+        
+        pg_password = os.getenv('PGPASSWORD')
+        if pg_password:
+            default_config['postgresql']['password'] = pg_password
         
         return default_config
     
-    def get_redis_config(self) -> Dict[str, Any]:
-        return self.config['redis']
+    def get_postgresql_config(self) -> Dict[str, Any]:
+        return self.config['postgresql']
     
     def get_logging_config(self) -> Dict[str, Any]:
         return self.config['logging']
 
+
 class DomainManager:
-    def __init__(self, datastore):
+    def __init__(self, datastore: DataStore):
         self.datastore = datastore
         self.logger = logging.getLogger(__name__)
 
-    def iter_domains(self, match: Optional[str] = None, regex: Optional[re.Pattern] = None, sort: bool = False, batch_size: int = 500000):
-        """Stream domains from Redis using SSCAN to reduce latency and memory use.
+    def iter_domains(self, match: Optional[str] = None, regex: Optional[re.Pattern] = None, sort: bool = False, batch_size: int = 500000) -> Iterator[str]:
+        """Stream domains from PostgreSQL using server-side cursor.
 
-        If sort is False (default), yields in scan order (faster, low memory).
+        If sort is False (default), yields in database order (faster, low memory).
         If sort is True, collects then sorts before yielding (slower, higher memory).
         """
         if sort:
-            # Fall back to existing get_domains + sort when explicit sort is requested
+            # Collect all, filter, then sort
             domains = self.get_domains()
             if match:
                 domains = {d for d in domains if match in d}
@@ -177,21 +348,13 @@ class DomainManager:
                 yield d
             return
 
-        cursor = 0
-        while True:
-            cursor, batch = self.datastore.r.sscan('domains', cursor=cursor, count=batch_size)
-            if not batch:
-                if cursor == 0:
-                    break
-            for raw in batch:
-                d = raw.decode('utf-8')
-                if match and match not in d:
-                    continue
-                if regex and not regex.search(d):
-                    continue
-                yield d
-            if cursor == 0:
-                break
+        # Stream via server-side cursor
+        for domain in self.datastore.iter_domains(batch_size=batch_size):
+            if match and match not in domain:
+                continue
+            if regex and not regex.search(domain):
+                continue
+            yield domain
     
     def export_domains(self, output_file: str, format_type: str = 'text') -> bool:
         try:
@@ -239,7 +402,6 @@ class DomainManager:
     def add_domains_from_stream(self, stream, validate: bool = True, batch_size: int = 500000) -> None:
         """Add domains from any file-like stream (stdin, file handle, etc.)"""
         try:
-            pipeline = self.datastore.r.pipeline(transaction=False)
             batch: list[str] = []
             total_domains = 0
             new_domains = 0
@@ -262,22 +424,16 @@ class DomainManager:
 
                 if len(batch) >= batch_size:
                     try:
-                        pipeline.sadd('domains', *batch)
-                        pipeline_results = pipeline.execute()
-                        if pipeline_results:
-                            new_domains += pipeline_results[-1]
-                    except redis.RedisError as e:
+                        new_domains += self.datastore.add_domains_batch(batch)
+                    except psycopg2.Error as e:
                         self.logger.error(f"Failed to add batch: {e}")
                     batch.clear()
             
             # Flush remaining batch
             if batch:
                 try:
-                    pipeline.sadd('domains', *batch)
-                    pipeline_results = pipeline.execute()
-                    if pipeline_results:
-                        new_domains += pipeline_results[-1]
-                except redis.RedisError as e:
+                    new_domains += self.datastore.add_domains_batch(batch)
+                except psycopg2.Error as e:
                     self.logger.error(f"Failed to add final batch: {e}")
                 batch.clear()
             
@@ -301,59 +457,8 @@ class DomainManager:
             return
         
         try:
-            pipeline = self.datastore.r.pipeline(transaction=False)
-            batch: list[str] = []
             with open(file_path, 'r') as file:
-                total_domains = 0
-                new_domains = 0
-                invalid_domains = 0
-                
-                for line_num, line in enumerate(file, 1):
-                    domain = line.strip()
-                    if not domain:
-                        continue
-                    
-                    processed_domain = self._process_domain(domain)
-                    
-                    if validate and not DomainValidator.is_valid_domain(processed_domain):
-                        self.logger.warning(f"Invalid domain '{domain}' on line {line_num}, skipping")
-                        invalid_domains += 1
-                        continue
-                    
-                    batch.append(processed_domain)
-                    total_domains += 1
-
-                    if len(batch) >= batch_size:
-                        try:
-                            added = pipeline.sadd('domains', *batch)
-                            pipeline_results = pipeline.execute()
-                            # pipeline_results is a list; we expect a single int for SADD
-                            if pipeline_results:
-                                new_domains += pipeline_results[-1]
-                        except redis.RedisError as e:
-                            self.logger.error(f"Failed to add batch: {e}")
-                        batch.clear()
-            # Flush remaining batch
-            if batch:
-                try:
-                    added = pipeline.sadd('domains', *batch)
-                    pipeline_results = pipeline.execute()
-                    if pipeline_results:
-                        new_domains += pipeline_results[-1]
-                except redis.RedisError as e:
-                    self.logger.error(f"Failed to add final batch: {e}")
-                batch.clear()
-                
-                duplicate_domains = total_domains - new_domains
-                duplicate_percentage = (duplicate_domains / total_domains * 100) if total_domains > 0 else 0
-                
-                self.logger.info(
-                    f"Processed {total_domains} domains: {new_domains} new, "
-                    f"{duplicate_domains} duplicates ({duplicate_percentage:.2f}%)"
-                )
-                if invalid_domains > 0:
-                    self.logger.warning(f"Skipped {invalid_domains} invalid domains")
-                    
+                self.add_domains_from_stream(file, validate=validate, batch_size=batch_size)
         except IOError as e:
             self.logger.error(f"Failed to read file {filename}: {e}")
 
@@ -383,7 +488,7 @@ class DomainManager:
                             not_found_domains += 1
                             self.logger.warning(f"Domain '{domain}' not found in database")
                         total_domains += 1
-                    except redis.RedisError as e:
+                    except psycopg2.Error as e:
                         self.logger.error(f"Failed to remove domain '{domain}': {e}")
                 
                 self.logger.info(
@@ -404,15 +509,14 @@ class DomainManager:
             else:
                 self.logger.warning(f"Domain '{domain}' not found in database")
                 return False
-        except redis.RedisError as e:
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to remove domain '{domain}': {e}")
             return False
 
     def get_domains(self) -> Set[str]:
         try:
-            raw_domains = self.datastore.get_domains()
-            return {domain.decode('utf-8') for domain in raw_domains}
-        except redis.RedisError as e:
+            return self.datastore.get_domains()
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to get domains: {e}")
             return set()
     
@@ -425,7 +529,7 @@ class DomainManager:
             count = self.datastore.count_domains()
             self.logger.info(f"Database contains {count} domains")
             return count
-        except redis.RedisError as e:
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to count domains: {e}")
             return None
 
@@ -443,9 +547,10 @@ class DomainManager:
             else:
                 self.logger.info("All domains deleted successfully")
                 return True
-        except redis.RedisError as e:
+        except psycopg2.Error as e:
             self.logger.error(f"Failed to delete all domains: {e}")
             return False
+
 
 def setup_logging(config: ConfigManager, silent: bool = False) -> None:
     logging_config = config.get_logging_config()
@@ -459,6 +564,7 @@ def setup_logging(config: ConfigManager, silent: bool = False) -> None:
         handlers=handlers
     )
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Manage bug bounty targets",
@@ -467,12 +573,13 @@ def main():
 Examples:
     add    : %(prog)s add -f domains.txt
              %(prog)s add -f raw.txt --no-validate
+             echo "domain.com" | %(prog)s add
     export : %(prog)s export -f out.json --format json --match .dell.com
     count  : %(prog)s count --regex '.*\\.dell\\.com$'
     print  : %(prog)s print --match .dell.com --sort
     remove : %(prog)s remove --match .dell.com
     delete : %(prog)s delete-all
-    silent : %(prog)s print --match .dell.com --silent
+    silent : %(prog)s -s print --match .dell.com
 
 Filter flags (where supported):
     --match SUBSTR   substring filter
@@ -543,129 +650,135 @@ Filter flags (where supported):
             logger.error(f"Invalid regex '{pattern_str}': {e}")
             return None
     
+    datastore = None
     try:
-        redis_config = config.get_redis_config()
-        datastore = DataStore(**redis_config)
+        pg_config = config.get_postgresql_config()
+        datastore = DataStore(**pg_config)
         domain_manager = DomainManager(datastore)
         
-    except redis.ConnectionError:
-        logger.error("Failed to connect to Redis. Please check your Redis server is running.")
+    except psycopg2.Error:
+        logger.error("Failed to connect to PostgreSQL. Please check your database server is running.")
         return 1
     except Exception as e:
         logger.error(f"Initialisation error: {e}")
         return 1
 
-    if args.command == 'add':
-        validate = not args.no_validate
-        if args.file:
-            domain_manager.add_domains_from_file(args.file, validate=validate)
-        else:
-            # Read from stdin
-            domain_manager.add_domains_from_stream(sys.stdin, validate=validate)
-        domain_manager.deduplicate()
-        
-    elif args.command == 'export':
-        pattern = compile_regex(args.regex)
-        if args.regex and pattern is None:
-            return 1
-
-        count_written = 0
-        try:
-            if args.format == 'json':
-                domains = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort))
-                export_data = {
-                    'domain_count': len(domains),
-                    'exported_at': str(datetime.now().isoformat()),
-                    'domains': domains if not args.sort else sorted(domains)
-                }
-                with open(args.file, 'w') as f:
-                    json.dump(export_data, f, indent=2)
-                count_written = export_data['domain_count']
+    try:
+        if args.command == 'add':
+            validate = not args.no_validate
+            if args.file:
+                domain_manager.add_domains_from_file(args.file, validate=validate)
             else:
-                # text export, stream to file to reduce memory
-                with open(args.file, 'w') as f:
-                    domains_iter = domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort)
-                    for d in domains_iter:
-                        f.write(f"{d}\n")
-                        count_written += 1
-            logger.info(f"Exported {count_written} domains to {args.file} ({args.format} format)")
-        except (IOError, json.JSONEncodeError) as e:
-            logger.error(f"Failed to export domains: {e}")
-            return 1
+                # Read from stdin
+                domain_manager.add_domains_from_stream(sys.stdin, validate=validate)
+            domain_manager.deduplicate()
             
-    elif args.command == 'print':
-        pattern = compile_regex(args.regex)
-        if args.regex and pattern is None:
-            return 1
-
-        # Stream via SSCAN to reduce startup latency and memory usage
-        found_any = False
-        try:
-            for domain in domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort):
-                found_any = True
-                print(domain)
-        except BrokenPipeError:
-            # Handle broken pipe gracefully when piping to head, etc.
-            pass
-
-        if not found_any:
-            logger.warning("No domains found in database")
-                
-    elif args.command == 'count':
-        pattern = compile_regex(args.regex)
-        if args.regex and pattern is None:
-            return 1
-
-        total = 0
-        try:
-            for _ in domain_manager.iter_domains(match=args.match, regex=pattern, sort=False):
-                total += 1
-            print(f"{total}")
-        except redis.RedisError as e:
-            logger.error(f"Failed to count domains: {e}")
-            return 1
-    
-    elif args.command == 'remove':
-        if args.file:
-            domain_manager.remove_domains_from_file(args.file)
-        elif args.domain:
-            if domain_manager.remove_domain(args.domain):
-                print(f"Domain '{args.domain}' removed from database")
-            else:
-                return 1
-        elif args.match or args.regex:
+        elif args.command == 'export':
             pattern = compile_regex(args.regex)
             if args.regex and pattern is None:
                 return 1
-            removed = 0
+
+            count_written = 0
             try:
-                # Collect candidates then remove to avoid modifying set during scan
-                to_remove = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=False))
-                for d in to_remove:
-                    removed += domain_manager.datastore.remove_domain(d)
-                logger.info(f"Removed {removed} domains using filter")
-            except redis.RedisError as e:
-                logger.error(f"Failed to remove domains with filter: {e}")
+                if args.format == 'json':
+                    domains = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort))
+                    export_data = {
+                        'domain_count': len(domains),
+                        'exported_at': str(datetime.now().isoformat()),
+                        'domains': domains if not args.sort else sorted(domains)
+                    }
+                    with open(args.file, 'w') as f:
+                        json.dump(export_data, f, indent=2)
+                    count_written = export_data['domain_count']
+                else:
+                    # text export, stream to file to reduce memory
+                    with open(args.file, 'w') as f:
+                        domains_iter = domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort)
+                        for d in domains_iter:
+                            f.write(f"{d}\n")
+                            count_written += 1
+                logger.info(f"Exported {count_written} domains to {args.file} ({args.format} format)")
+            except (IOError, json.JSONEncodeError) as e:
+                logger.error(f"Failed to export domains: {e}")
                 return 1
-        else:
-            return 1
-            
-    elif args.command == 'delete-all':
-        if not args.confirm:
-            response = input("Are you sure you want to delete ALL domains from the database? (y/N): ")
-            if response.lower() not in ['y', 'yes']:
-                logger.info("Delete operation cancelled")
-                return 0
+                
+        elif args.command == 'print':
+            pattern = compile_regex(args.regex)
+            if args.regex and pattern is None:
+                return 1
+
+            # Stream via server-side cursor to reduce startup latency and memory usage
+            found_any = False
+            try:
+                for domain in domain_manager.iter_domains(match=args.match, regex=pattern, sort=args.sort):
+                    found_any = True
+                    print(domain)
+            except BrokenPipeError:
+                # Handle broken pipe gracefully when piping to head, etc.
+                pass
+
+            if not found_any:
+                logger.warning("No domains found in database")
+                    
+        elif args.command == 'count':
+            pattern = compile_regex(args.regex)
+            if args.regex and pattern is None:
+                return 1
+
+            total = 0
+            try:
+                for _ in domain_manager.iter_domains(match=args.match, regex=pattern, sort=False):
+                    total += 1
+                print(f"{total}")
+            except psycopg2.Error as e:
+                logger.error(f"Failed to count domains: {e}")
+                return 1
         
-        if domain_manager.delete_all():
-            print("All domains deleted successfully")
-        else:
-            return 1
+        elif args.command == 'remove':
+            if args.file:
+                domain_manager.remove_domains_from_file(args.file)
+            elif args.domain:
+                if domain_manager.remove_domain(args.domain):
+                    print(f"Domain '{args.domain}' removed from database")
+                else:
+                    return 1
+            elif args.match or args.regex:
+                pattern = compile_regex(args.regex)
+                if args.regex and pattern is None:
+                    return 1
+                removed = 0
+                try:
+                    # Collect candidates then remove to avoid modifying during iteration
+                    to_remove = list(domain_manager.iter_domains(match=args.match, regex=pattern, sort=False))
+                    if to_remove:
+                        removed = datastore.remove_domains_batch(to_remove)
+                    logger.info(f"Removed {removed} domains using filter")
+                except psycopg2.Error as e:
+                    logger.error(f"Failed to remove domains with filter: {e}")
+                    return 1
+            else:
+                return 1
+                
+        elif args.command == 'delete-all':
+            if not args.confirm:
+                response = input("Are you sure you want to delete ALL domains from the database? (y/N): ")
+                if response.lower() not in ['y', 'yes']:
+                    logger.info("Delete operation cancelled")
+                    return 0
+            
+            if domain_manager.delete_all():
+                print("All domains deleted successfully")
+            else:
+                return 1
+        
+        return 0
     
-    return 0
+    finally:
+        if datastore:
+            datastore.close()
+
 
 if __name__ == '__main__':
-    import sys
     try:
         exit_code = main()
         sys.exit(exit_code or 0)

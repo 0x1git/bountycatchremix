@@ -1,8 +1,11 @@
 {
-  "redis": {
+  "postgresql": {
     "host": "localhost",
-    "port": 6379,
-    "db": 0,
+    "port": 5432,
+    "database": "bountycatch",
+    "user": "postgres",
+    "password": "228899",
+    "min_connections": 1,
     "max_connections": 10
   },
   "logging": {
