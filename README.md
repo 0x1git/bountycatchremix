@@ -14,12 +14,13 @@ This repository contains *my remix* of Jason Haddix's [`bountycatch.py`](https:/
 
 All operations use PostgreSQL COPY protocol by default for maximum speed:
 
-| Operation | Domains | Time |
-|-----------|---------|------|
-| Add | 1,000,000 | ~3.4s |
-| Count | 1,000,000 | ~0.08s |
-| Print | 1,000,000 | ~2.5s |
-| Export | 1,000,000 | ~1.2s |
+| Operation | Domains | Time | Throughput |
+|-----------|---------|------|------------|
+| Add | 1,000,000 | ~3.4s | ~294K/sec |
+| Add | 21,637,355 | ~122s | ~177K/sec |
+| Count | 21,000,000 | ~0.1s | instant |
+| Print | 1,000,000 | ~0.4s | ~2.5M/sec |
+| Export | 1,000,000 | ~1.2s | ~833K/sec |
 
 ## Features
 
@@ -40,7 +41,7 @@ All operations use PostgreSQL COPY protocol by default for maximum speed:
 - **PostgreSQL storage** - reliable, persistent, handles 10M+ domains
 - **Connection pooling** - efficient database connections with deadpool
 - **Async I/O** - tokio-based async runtime for high throughput
-- **COPY protocol** - PostgreSQL COPY for bulk operations (~300K domains/sec)
+- **COPY protocol** - PostgreSQL COPY for bulk operations (~175K domains/sec)
 - **Stdin support** - pipe domains directly: `echo "domain.com" | bountycatch add`
 - **Silent mode** - `-s` flag suppresses logs for clean piped output
 - **Auto-config detection** - finds config.json from standard locations
@@ -189,7 +190,7 @@ bountycatch add -f raw.txt --no-validate
 ```
 
 > **Performance**: Uses PostgreSQL COPY protocol with index rebuilding for 
-> maximum throughput (~300K domains/sec on typical hardware).
+> maximum throughput (~175K domains/sec at scale, faster for smaller batches).
 
 #### **Printing Domains**
 
