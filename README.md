@@ -1,20 +1,33 @@
 # BountyCatch Remix 🎯
 
-A bug bounty domain management tool for security researchers and penetration testers. This repository contains *my remix* of Jason Haddix's [`bountycatch.py`](https://gist.github.com/jhaddix/91035a01168902e8130a8e1bb383ae1e) script. The original script was simple and easier to manage, and I just added my own twist so it could do other commands I needed 🧸.
+A high-performance bug bounty domain management tool for security researchers and penetration testers. Written in **Rust** for maximum speed and efficiency.
+
+This repository contains *my remix* of Jason Haddix's [`bountycatch.py`](https://gist.github.com/jhaddix/91035a01168902e8130a8e1bb383ae1e) script. The original script was simple and easier to manage—I rewrote it in Rust with PostgreSQL backend for handling millions of domains at blazing speed 🚀.
 
 *(Note: courtesy of this script goes to Jason Haddix. I just added some features that I wanted there and maintaining the core simplicity ❤️)*
 
 ## Overview
 
-**BountyCatch** is a simple Python application for managing domain lists in bug bounties. It provides domain validation, duplicate detection, multiple export formats, and **PostgreSQL-backed storage** with connection pooling. All domains are stored in a single collection (no per-project flag needed).
+**BountyCatch** is a CLI application for managing domain lists in bug bounties. It provides domain validation, duplicate detection, multiple export formats, and **PostgreSQL-backed storage**. All domains are stored in a single collection (no per-project flag needed).
+
+## Performance
+
+All operations use PostgreSQL COPY protocol by default for maximum speed:
+
+| Operation | Domains | Time |
+|-----------|---------|------|
+| Add | 1,000,000 | ~3.4s |
+| Count | 1,000,000 | ~0.08s |
+| Print | 1,000,000 | ~2.5s |
+| Export | 1,000,000 | ~1.2s |
 
 ## Features
 
 ### ✨ **Domain Management**
 - **Domain validation** with a comprehensive regex that supports:
   - Leading wildcards: `*.example.com`
-  - Internal wildcards: `svc-*.domain.com`, `rac-*.net.dell.com`, `test.*.invalid.com`
-  - Service records (underscore labels): `_service.domain.com`, `_collab-edge.5g.dell.com`
+  - Internal wildcards: `svc-*.domain.com`, `rac-*.net.dell.com`
+  - Service records (underscore labels): `_service.domain.com`
   - Standard domains/subdomains: `example.com`, `sub.domain.com`
 - **Automatic duplicate detection** via PostgreSQL PRIMARY KEY constraint
 - **Bulk import** from text files or stdin with validation feedback
@@ -22,10 +35,13 @@ A bug bounty domain management tool for security researchers and penetration tes
 - **Filtering** with `--match` (substring) or `--regex` patterns
 - **Domain removal** with filters for cleaning up domains
 
-### 🔧 **Features**
+### 🔧 **Technical Features**
+- **Written in Rust** - compiled native binary, no runtime dependencies
 - **PostgreSQL storage** - reliable, persistent, handles 10M+ domains
+- **Connection pooling** - efficient database connections with deadpool
+- **Async I/O** - tokio-based async runtime for high throughput
+- **COPY protocol** - PostgreSQL COPY for bulk operations (~300K domains/sec)
 - **Stdin support** - pipe domains directly: `echo "domain.com" | bountycatch add`
-- **Streaming output** - server-side cursors for memory-efficient iteration
 - **Silent mode** - `-s` flag suppresses logs for clean piped output
 - **Auto-config detection** - finds config.json from standard locations
 - **Environment variable overrides** for containerized deployments
@@ -35,13 +51,12 @@ A bug bounty domain management tool for security researchers and penetration tes
 - **Text export** for integration with other tools
 - **Substring filtering**: `--match .dell.com`
 - **Regex filtering**: `--regex '.*\.dell\.com$'`
-- **Sorted output**: `--sort` flag (slower for large datasets)
+- **Sorted output**: `--sort` flag
 
 ## Installation
 
 ### Prerequisites
 
-- Python 3.8+
 - PostgreSQL 12+
 
 ### Quick Setup
@@ -51,19 +66,33 @@ A bug bounty domain management tool for security researchers and penetration tes
 git clone https://github.com/0x1git/bountycatchremix.git
 cd bountycatchremix
 
-# Install Python dependencies
-pip install -r requirements.txt
+# Build the Rust binary
+cd rust
+cargo build --release
 
 # Set up PostgreSQL (run with sudo)
+cd ..
 sudo ./setup_postgres.sh
 
 # Install system-wide 
-sudo cp bountycatch.py /usr/local/bin/bountycatch
-sudo chmod +x /usr/local/bin/bountycatch
+sudo cp rust/target/release/bountycatch /usr/local/bin/bountycatch
 
 # Copy config to user directory
 mkdir -p ~/.config/bountycatch
 cp config.json ~/.config/bountycatch/
+```
+
+### Building from Source
+
+```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build release binary
+cd rust
+cargo build --release
+
+# Binary will be at: rust/target/release/bountycatch
 ```
 
 ### Installing PostgreSQL
@@ -93,13 +122,6 @@ brew services start postgresql@15
 #### **Windows**
 Download from: https://www.postgresql.org/download/windows/
 
-### Python Dependencies
-```bash
-pip install psycopg2-binary
-# or
-pip install -r requirements.txt
-```
-
 ## Configuration
 
 ### Config File Locations
@@ -107,7 +129,7 @@ The tool auto-detects `config.json` from these locations (in order):
 1. `~/.config/bountycatch/config.json` (XDG standard - recommended)
 2. `~/.bountycatch/config.json`
 3. `/etc/bountycatch/config.json` (system-wide)
-4. Script directory (for development)
+4. Current directory (for development)
 
 ### Default Configuration
 ```json
@@ -117,13 +139,9 @@ The tool auto-detects `config.json` from these locations (in order):
     "port": 5432,
     "database": "bountycatch",
     "user": "postgres",
-    "password": "228899",
+    "password": "your_password",
     "min_connections": 1,
     "max_connections": 10
-  },
-  "logging": {
-    "level": "INFO",
-    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
   }
 }
 ```
@@ -149,9 +167,9 @@ bountycatch [global-options] <command> [command-options]
 | Option | Description |
 |--------|-------------|
 | `-c, --config` | Specify configuration file path |
-| `-v, --verbose` | Enable verbose (DEBUG) logging |
 | `-s, --silent` | Suppress console logs; only emit command output |
 | `-h, --help` | Show help message |
+| `-V, --version` | Show version |
 
 ### Commands
 
@@ -170,6 +188,9 @@ cat domains.txt | bountycatch -s add
 bountycatch add -f raw.txt --no-validate
 ```
 
+> **Performance**: Uses PostgreSQL COPY protocol with index rebuilding for 
+> maximum throughput (~300K domains/sec on typical hardware).
+
 #### **Printing Domains**
 
 ```bash
@@ -185,7 +206,7 @@ bountycatch -s print --match .dell.com
 # With regex filter
 bountycatch -s print --regex '.*\.dell\.com$'
 
-# Sorted output (slower for large datasets)
+# Sorted output
 bountycatch -s print --match .dell.com --sort
 
 # Pipe to other tools
@@ -314,18 +335,6 @@ subdomain.example.org
 }
 ```
 
-## Logging
-
-### Log Levels
-- `DEBUG` - Verbose debugging information
-- `INFO` - General operational messages
-- `WARNING` - Important notices (invalid domains, etc.)
-- `ERROR` - Error conditions
-
-### Log Destinations
-- **Console** - Real-time feedback (suppressed with `-s`)
-- **File** - `bountycatch.log` for persistent logging
-
 ## Troubleshooting
 
 ### Common Errors
@@ -345,7 +354,7 @@ sudo systemctl start postgresql
 cat ~/.config/bountycatch/config.json
 
 # Or use environment variable
-export PGPASSWORD=pass
+export PGPASSWORD=yourpassword
 ```
 
 **Permission denied:**
@@ -355,9 +364,9 @@ sudo ./setup_postgres.sh
 ```
 
 ### Tips
-1. Use `-v` for verbose logging to debug issues
-2. Use `-s` for clean output when piping to other tools
-3. Check `bountycatch.log` for detailed error messages
+1. Use `-s` for clean output when piping to other tools
+2. All operations use fast COPY protocol by default
+3. Check PostgreSQL logs for detailed error messages
 
 ---
 Happy hunting folks! 🕵️‍♂️

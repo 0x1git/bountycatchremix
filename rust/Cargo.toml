@@ -1,0 +1,30 @@
+[package]
+name = "bountycatch"
+version = "2.0.0"
+edition = "2021"
+authors = ["Bug Bounty Tools"]
+description = "Ultra-fast bug bounty domain management tool"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = { version = "0.12" }
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+lazy_static = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+anyhow = "1.0"
+thiserror = "1.0"
+futures = "0.3"
+futures-util = "0.3"
+bytes = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
