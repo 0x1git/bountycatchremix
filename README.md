@@ -47,7 +47,7 @@ You'll need **Redis** installed and running on your system.
 #### **Linux (Ubuntu/Debian)**
 ```bash
 sudo apt update
-sudo apt install redis-server redis-tools
+sudo apt install redis-server -y
 
 # Start Redis service
 sudo systemctl start redis
