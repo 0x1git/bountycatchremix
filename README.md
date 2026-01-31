@@ -224,6 +224,10 @@ bountycatch export -f sorted.txt --sort
 #### **Removing Domains**
 
 ```bash
+# Remove from stdin (pipe from other tools)
+echo "unwanted.example.com" | bountycatch remove
+cat domains_to_remove.txt | bountycatch remove
+
 # Remove a single domain
 bountycatch remove -d unwanted-domain.com
 

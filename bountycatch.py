@@ -462,6 +462,46 @@ class DomainManager:
         except IOError as e:
             self.logger.error(f"Failed to read file {filename}: {e}")
 
+    def remove_domains_from_stream(self, stream, batch_size: int = 10000) -> None:
+        """Remove domains from any file-like stream (stdin, file handle, etc.)"""
+        try:
+            batch: list[str] = []
+            total_domains = 0
+            removed_domains = 0
+            
+            for line in stream:
+                domain = line.strip()
+                if not domain:
+                    continue
+                
+                batch.append(domain)
+                total_domains += 1
+
+                if len(batch) >= batch_size:
+                    try:
+                        removed_domains += self.datastore.remove_domains_batch(batch)
+                    except psycopg2.Error as e:
+                        self.logger.error(f"Failed to remove batch: {e}")
+                    batch.clear()
+            
+            # Flush remaining batch
+            if batch:
+                try:
+                    removed_domains += self.datastore.remove_domains_batch(batch)
+                except psycopg2.Error as e:
+                    self.logger.error(f"Failed to remove final batch: {e}")
+                batch.clear()
+            
+            not_found_domains = total_domains - removed_domains
+            
+            self.logger.info(
+                f"Processed {total_domains} domains: {removed_domains} removed, "
+                f"{not_found_domains} not found"
+            )
+                
+        except IOError as e:
+            self.logger.error(f"Failed to read stream: {e}")
+
     def remove_domains_from_file(self, filename: str) -> None:
         """Remove domains listed in a file from the database"""
         file_path = Path(filename)
@@ -471,30 +511,7 @@ class DomainManager:
         
         try:
             with open(file_path, 'r') as file:
-                total_domains = 0
-                removed_domains = 0
-                not_found_domains = 0
-                
-                for line_num, line in enumerate(file, 1):
-                    domain = line.strip()
-                    if not domain:
-                        continue
-                    
-                    try:
-                        removed = self.datastore.remove_domain(domain)
-                        if removed > 0:
-                            removed_domains += 1
-                        else:
-                            not_found_domains += 1
-                            self.logger.warning(f"Domain '{domain}' not found in database")
-                        total_domains += 1
-                    except psycopg2.Error as e:
-                        self.logger.error(f"Failed to remove domain '{domain}': {e}")
-                
-                self.logger.info(
-                    f"Processed {total_domains} domains: {removed_domains} removed, "
-                    f"{not_found_domains} not found"
-                )
+                self.remove_domains_from_stream(file)
                     
         except IOError as e:
             self.logger.error(f"Failed to read file {filename}: {e}")
@@ -613,9 +630,9 @@ Filter flags (where supported):
     count_filter.add_argument('--match', help='Filter domains containing this substring before counting')
     count_filter.add_argument('--regex', help='Filter domains matching this regex before counting')
     
-    remove_parser = subparsers.add_parser('remove', help='Remove domains from database (supports filtering)')
-    remove_group = remove_parser.add_mutually_exclusive_group(required=True)
-    remove_group.add_argument('-f', '--file', help='File containing domains to remove')
+    remove_parser = subparsers.add_parser('remove', help='Remove domains from database (supports filtering/stdin)')
+    remove_group = remove_parser.add_mutually_exclusive_group()
+    remove_group.add_argument('-f', '--file', help='File containing domains to remove (reads stdin if omitted)')
     remove_group.add_argument('-d', '--domain', help='Single domain to remove')
     remove_group.add_argument('--match', help='Remove domains containing this substring')
     remove_group.add_argument('--regex', help='Remove domains matching this regex')
@@ -757,7 +774,8 @@ Filter flags (where supported):
                     logger.error(f"Failed to remove domains with filter: {e}")
                     return 1
             else:
-                return 1
+                # Read from stdin
+                domain_manager.remove_domains_from_stream(sys.stdin)
                 
         elif args.command == 'delete-all':
             if not args.confirm:
