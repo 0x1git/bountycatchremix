@@ -1,6 +1,6 @@
 use anyhow::Result;
 use deadpool_postgres::Pool;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::fs::File;
 use std::time::Instant;
@@ -8,8 +8,10 @@ use tokio_postgres::types::ToSql;
 
 use crate::domain::is_valid_domain;
 
-const BATCH_SIZE: usize = 100_000;
+const BATCH_SIZE: usize = 10_000;
 const COPY_CHUNK_SIZE: usize = 5_000_000;
+// Threshold: use COPY+rebuild for large imports, INSERT for small ones
+const BULK_THRESHOLD: usize = 100_000;
 
 pub async fn run(
     pool: &Pool,
@@ -19,7 +21,45 @@ pub async fn run(
 ) -> Result<()> {
     let start = Instant::now();
 
-    run_fast(pool, file, validate, silent).await?;
+    // First, read and validate all domains into memory
+    let reader: Box<dyn BufRead> = match &file {
+        Some(path) => Box::new(BufReader::with_capacity(1024 * 1024, File::open(path)?)),
+        None => Box::new(BufReader::with_capacity(1024 * 1024, io::stdin().lock())),
+    };
+
+    let mut domains: Vec<String> = Vec::new();
+    let mut total = 0u64;
+    let mut invalid = 0u64;
+
+    for line in reader.lines() {
+        let line = line?;
+        let domain = line.trim();
+        if domain.is_empty() {
+            continue;
+        }
+
+        total += 1;
+
+        if validate && !is_valid_domain(domain) {
+            invalid += 1;
+            continue;
+        }
+
+        domains.push(domain.to_string());
+    }
+
+    // Choose strategy based on batch size
+    if domains.len() >= BULK_THRESHOLD {
+        if !silent {
+            eprintln!("Adding {} domains (bulk COPY mode)...", domains.len());
+        }
+        run_bulk_copy(pool, domains, total, invalid, silent).await?;
+    } else {
+        if !silent && domains.len() > 0 {
+            eprintln!("Adding {} domains...", domains.len());
+        }
+        run_insert(pool, domains, total, invalid, silent).await?;
+    }
 
     if !silent {
         eprintln!("Completed in {:.1}s", start.elapsed().as_secs_f64());
@@ -28,10 +68,51 @@ pub async fn run(
     Ok(())
 }
 
-async fn run_fast(
+/// Fast INSERT with ON CONFLICT for small batches (< 100K domains)
+async fn run_insert(
     pool: &Pool,
-    file: Option<PathBuf>,
-    validate: bool,
+    domains: Vec<String>,
+    total: u64,
+    invalid: u64,
+    silent: bool,
+) -> Result<()> {
+    let client = pool.get().await?;
+    let start = Instant::now();
+
+    let mut new_count = 0u64;
+
+    // Process in batches
+    for chunk in domains.chunks(BATCH_SIZE) {
+        new_count += insert_batch(&client, chunk).await?;
+    }
+
+    let valid_count = total - invalid;
+    let duplicate_count = valid_count - new_count;
+
+    if !silent {
+        let pct = if valid_count > 0 {
+            (duplicate_count as f64 / valid_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "Processed {} domains: {} new, {} duplicates ({:.2}%) in {:.1}s",
+            total, new_count, duplicate_count, pct, start.elapsed().as_secs_f64()
+        );
+        if invalid > 0 {
+            eprintln!("Skipped {} invalid domains", invalid);
+        }
+    }
+
+    Ok(())
+}
+
+/// Bulk COPY with index rebuild for large imports (>= 100K domains)
+async fn run_bulk_copy(
+    pool: &Pool,
+    domains: Vec<String>,
+    total: u64,
+    invalid: u64,
     silent: bool,
 ) -> Result<()> {
     let client = pool.get().await?;
@@ -54,41 +135,9 @@ async fn run_fast(
     client.execute("SET LOCAL work_mem = '256MB'", &[]).await?;
     client.execute("SET LOCAL maintenance_work_mem = '512MB'", &[]).await?;
 
-    let reader: Box<dyn BufRead> = match file {
-        Some(path) => Box::new(BufReader::with_capacity(1024 * 1024, File::open(path)?)),
-        None => Box::new(BufReader::with_capacity(1024 * 1024, io::stdin().lock())),
-    };
-
-    let mut total = 0u64;
-    let mut invalid = 0u64;
-    let mut buffer = Vec::with_capacity(COPY_CHUNK_SIZE);
-
-    // Build COPY data
-    for line in reader.lines() {
-        let line = line?;
-        let domain = line.trim();
-        if domain.is_empty() {
-            continue;
-        }
-
-        total += 1;
-
-        if validate && !is_valid_domain(domain) {
-            invalid += 1;
-            continue;
-        }
-
-        buffer.push(domain.to_string());
-
-        if buffer.len() >= COPY_CHUNK_SIZE {
-            copy_domains(&client, &buffer).await?;
-            buffer.clear();
-        }
-    }
-
-    // Final chunk
-    if !buffer.is_empty() {
-        copy_domains(&client, &buffer).await?;
+    // Insert in chunks
+    for chunk in domains.chunks(COPY_CHUNK_SIZE) {
+        copy_domains(&client, chunk).await?;
     }
 
     // Deduplicate
@@ -150,72 +199,6 @@ async fn copy_domains(client: &deadpool_postgres::Client, domains: &[String]) ->
     sink.send(bytes::Bytes::from(data)).await?;
     sink.close().await?;
     
-    Ok(())
-}
-
-async fn run_batch(
-    pool: &Pool,
-    file: Option<PathBuf>,
-    validate: bool,
-    silent: bool,
-) -> Result<()> {
-    let client = pool.get().await?;
-    let start = Instant::now();
-
-    let reader: Box<dyn BufRead> = match file {
-        Some(path) => Box::new(BufReader::with_capacity(512 * 1024, File::open(path)?)),
-        None => Box::new(BufReader::with_capacity(512 * 1024, io::stdin().lock())),
-    };
-
-    let mut total = 0u64;
-    let mut new_count = 0u64;
-    let mut invalid = 0u64;
-    let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
-
-    for line in reader.lines() {
-        let line = line?;
-        let domain = line.trim();
-        if domain.is_empty() {
-            continue;
-        }
-
-        total += 1;
-
-        if validate && !is_valid_domain(domain) {
-            invalid += 1;
-            continue;
-        }
-
-        batch.push(domain.to_string());
-
-        if batch.len() >= BATCH_SIZE {
-            new_count += insert_batch(&client, &batch).await?;
-            batch.clear();
-        }
-    }
-
-    if !batch.is_empty() {
-        new_count += insert_batch(&client, &batch).await?;
-    }
-
-    let valid_count = total - invalid;
-    let duplicate_count = valid_count - new_count;
-
-    if !silent {
-        let pct = if valid_count > 0 {
-            (duplicate_count as f64 / valid_count as f64) * 100.0
-        } else {
-            0.0
-        };
-        eprintln!(
-            "Processed {} domains: {} new, {} duplicates ({:.2}%) in {:.1}s",
-            total, new_count, duplicate_count, pct, start.elapsed().as_secs_f64()
-        );
-        if invalid > 0 {
-            eprintln!("Skipped {} invalid domains", invalid);
-        }
-    }
-
     Ok(())
 }
 
